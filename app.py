@@ -203,9 +203,11 @@ def compute_feature_ranking(df: pd.DataFrame, feature_pool: tuple):
 # ----------------------------------------------------------------------------
 def score_dataset(raw_df: pd.DataFrame, train_df: pd.DataFrame, bundle: dict):
     """Run bundle's model over raw_df (which may be missing columns / have
-    unseen categories) and return raw_df with Predicted_Attrition and
-    Attrition_Probability_% columns added, plus a list of notes describing
-    any filling/mapping that had to happen."""
+    unseen categories) and return raw_df with a predicted attrition column added
+    (named 'Attrition' if the input didn't already have one, so the output reads
+    like a normal attrition dataset; 'Predicted_Attrition' otherwise, to sit
+    alongside the real 'Attrition' column for comparison), plus a list of notes
+    describing any filling/mapping that had to happen."""
     feature_names = bundle["feature_names"]
     encoders = bundle["encoders"]
     model = bundle["model"]
@@ -251,7 +253,8 @@ def score_dataset(raw_df: pd.DataFrame, train_df: pd.DataFrame, bundle: dict):
     probs = model.predict_proba(X_score)[:, 1]
 
     out = raw_df.copy()
-    out["Predicted_Attrition"] = np.where(preds == 1, "Yes", "No")
+    label_col = "Attrition" if "Attrition" not in raw_df.columns else "Predicted_Attrition"
+    out[label_col] = np.where(preds == 1, "Yes", "No")
     out["Attrition_Probability_%"] = (probs * 100).round(1)
     return out, notes
 
