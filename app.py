@@ -201,6 +201,20 @@ def compute_feature_ranking(df: pd.DataFrame, feature_pool: tuple):
 # ----------------------------------------------------------------------------
 # PDF REPORT
 # ----------------------------------------------------------------------------
+def _pdf_safe(text: str) -> str:
+    """fpdf2's default core font (Helvetica) only supports latin-1. Replace common
+    unicode punctuation and drop anything else it can't encode, so arbitrary
+    column names / uploaded file names never crash report generation."""
+    if not isinstance(text, str):
+        text = str(text)
+    replacements = {
+        "—": "-", "–": "-", "’": "'", "‘": "'", "“": '"', "”": '"', "…": "...",
+    }
+    for bad, good in replacements.items():
+        text = text.replace(bad, good)
+    return text.encode("latin-1", "replace").decode("latin-1")
+
+
 def generate_pdf_report(data_source, df, algorithm, max_depth, n_estimators,
                          missing_expected, missing_report, bundle, ranked_importance):
     pdf = FPDF()
@@ -218,11 +232,11 @@ def generate_pdf_report(data_source, df, algorithm, max_depth, n_estimators,
     def section(title):
         pdf.ln(2)
         pdf.set_font("Helvetica", "B", 13)
-        pdf.cell(0, 8, title, ln=True)
+        pdf.cell(0, 8, _pdf_safe(title), ln=True)
         pdf.set_font("Helvetica", "", 10)
 
     section("Dataset Summary")
-    pdf.cell(0, 6, f"Source: {data_source}", ln=True)
+    pdf.cell(0, 6, _pdf_safe(f"Source: {data_source}"), ln=True)
     pdf.cell(0, 6, f"Rows: {len(df)}    Columns: {df.shape[1]}", ln=True)
     if "Attrition" in df.columns:
         attr_rate = (df["Attrition"] == "Yes").mean() * 100
@@ -231,8 +245,8 @@ def generate_pdf_report(data_source, df, algorithm, max_depth, n_estimators,
     if missing_expected:
         pdf.ln(1)
         pdf.set_font("Helvetica", "I", 9)
-        pdf.multi_cell(0, 5, "Standard features not present in this dataset (skipped): "
-                              + ", ".join(missing_expected))
+        pdf.multi_cell(0, 5, _pdf_safe("Standard features not present in this dataset (skipped): "
+                              + ", ".join(missing_expected)))
         pdf.set_font("Helvetica", "", 10)
 
     if missing_report:
@@ -242,7 +256,7 @@ def generate_pdf_report(data_source, df, algorithm, max_depth, n_estimators,
         pdf.set_font("Helvetica", "", 10)
         for col, cnt in missing_report.items():
             pct = cnt / len(df) * 100
-            pdf.cell(0, 5, f"  - {col}: {cnt} missing ({pct:.1f}%)", ln=True)
+            pdf.cell(0, 5, _pdf_safe(f"  - {col}: {cnt} missing ({pct:.1f}%)"), ln=True)
 
     section("Model Configuration")
     pdf.cell(0, 6, f"Algorithm: {algorithm}", ln=True)
@@ -268,7 +282,8 @@ def generate_pdf_report(data_source, df, algorithm, max_depth, n_estimators,
     total = ranked_importance.sum() or 1
     for rank, (feat, imp) in enumerate(ranked_importance.items(), start=1):
         used = "*" if feat in bundle["feature_names"] else " "
-        pdf.cell(0, 5, f"{rank:>2}. [{used}] {feat} — {imp/total*100:.1f}%", ln=True)
+        line = f"{rank:>2}. [{used}] {feat} - {imp/total*100:.1f}%"
+        pdf.cell(0, 5, _pdf_safe(line), ln=True)
     pdf.set_font("Helvetica", "I", 8)
     pdf.cell(0, 5, "[*] = included in the currently trained model", ln=True)
 
