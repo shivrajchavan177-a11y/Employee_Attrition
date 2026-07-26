@@ -1,0 +1,811 @@
+import io
+import pickle
+from datetime import datetime
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import streamlit as st
+import plotly.express as px
+import plotly.graph_objects as go
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import LabelEncoder
+from sklearn.tree import DecisionTreeClassifier
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.metrics import (
+    confusion_matrix, accuracy_score, precision_score, recall_score,
+    f1_score, roc_curve, roc_auc_score, precision_recall_curve, auc
+)
+
+# ----------------------------------------------------------------------------
+# PAGE CONFIG
+# ----------------------------------------------------------------------------
+st.set_page_config(
+    page_title="Employee Attrition Dashboard",
+    page_icon="📊",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
+
+DATA_PATH = "data/employee_attrition.csv"
+MODEL_DIR = Path("models")
+DROP_COLS = ["EmployeeCount", "EmployeeNumber", "Over18", "StandardHours"]
+
+# The columns the bundled IBM HR dataset ships with (minus drop cols/target).
+# Used only as a reference to tell the user which "standard" features are
+# missing when they upload their own file — everything still works without them.
+EXPECTED_FEATURES = [
+    "Age", "BusinessTravel", "DailyRate", "Department", "DistanceFromHome",
+    "Education", "EducationField", "EnvironmentSatisfaction", "Gender",
+    "HourlyRate", "JobInvolvement", "JobLevel", "JobRole", "JobSatisfaction",
+    "MaritalStatus", "MonthlyIncome", "MonthlyRate", "NumCompaniesWorked",
+    "OverTime", "PercentSalaryHike", "PerformanceRating",
+    "RelationshipSatisfaction", "StockOptionLevel", "TotalWorkingYears",
+    "TrainingTimesLastYear", "WorkLifeBalance", "YearsAtCompany",
+    "YearsInCurrentRole", "YearsSinceLastPromotion", "YearsWithCurrManager",
+]
+
+
+def has_col(df, col):
+    return col in df.columns
+
+
+def impute_missing(work: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
+    """Fill missing values (numeric -> median, categorical -> mode) and report what was filled."""
+    report = {}
+    for col in work.columns:
+        n_missing = int(work[col].isna().sum())
+        if n_missing > 0:
+            if work[col].dtype == object:
+                fill_val = work[col].mode(dropna=True)
+                fill_val = fill_val.iloc[0] if len(fill_val) else "Unknown"
+            else:
+                fill_val = work[col].median()
+            work[col] = work[col].fillna(fill_val)
+            report[col] = n_missing
+    return work, report
+
+
+# ----------------------------------------------------------------------------
+# DATA LOADING
+# ----------------------------------------------------------------------------
+@st.cache_data
+def load_default_data():
+    return pd.read_csv(DATA_PATH)
+
+
+# ----------------------------------------------------------------------------
+# MODEL TRAINING (cached)
+# ----------------------------------------------------------------------------
+def _load_pretrained(df: pd.DataFrame, selected_features, algorithm, max_depth):
+    """Use artifacts saved by train.py, but only when the sidebar selections match
+    exactly what train.py trained on (full default feature set, Decision Tree, depth 5,
+    default bundled dataset)."""
+    required = ["model.pkl", "encoders.pkl", "feature_names.pkl"]
+    if not all((MODEL_DIR / f).exists() for f in required):
+        return None
+    if algorithm != "Decision Tree" or max_depth != 5:
+        return None
+    try:
+        with open(MODEL_DIR / "model.pkl", "rb") as f:
+            model = pickle.load(f)
+        with open(MODEL_DIR / "encoders.pkl", "rb") as f:
+            encoders = pickle.load(f)
+        with open(MODEL_DIR / "feature_names.pkl", "rb") as f:
+            feature_names = pickle.load(f)
+    except Exception:
+        return None
+
+    if list(feature_names) != list(selected_features):
+        return None
+
+    work = df.drop(columns=[c for c in DROP_COLS if c in df.columns]).copy()
+    try:
+        for col, le in encoders.items():
+            work[col] = le.transform(work[col])
+    except Exception:
+        return None
+    X = work[feature_names]
+    y = work["Attrition"]
+    _, X_test, _, y_test = train_test_split(X, y, test_size=0.2, random_state=42, stratify=y)
+
+    y_pred = model.predict(X_test)
+    y_prob = model.predict_proba(X_test)[:, 1]
+
+    metrics = {
+        "accuracy": accuracy_score(y_test, y_pred),
+        "precision": precision_score(y_test, y_pred),
+        "recall": recall_score(y_test, y_pred),
+        "f1": f1_score(y_test, y_pred),
+        "roc_auc": roc_auc_score(y_test, y_prob),
+    }
+
+    return {
+        "model": model, "encoders": encoders, "feature_names": list(feature_names),
+        "X_test": X_test, "y_test": y_test, "y_pred": y_pred, "y_prob": y_prob,
+        "metrics": metrics, "source": "pretrained", "missing_report": {},
+    }
+
+
+@st.cache_resource
+def train_model(df: pd.DataFrame, selected_features: tuple, algorithm: str,
+                 max_depth: int = 5, n_estimators: int = 200):
+    selected_features = list(selected_features)
+
+    work = df.drop(columns=[c for c in DROP_COLS if c in df.columns]).copy()
+    work, missing_report = impute_missing(work)
+
+    encoders = {}
+    for col in work.select_dtypes(include="object").columns:
+        le = LabelEncoder()
+        work[col] = le.fit_transform(work[col])
+        encoders[col] = le
+
+    X = work[selected_features]
+    y = work["Attrition"]
+
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=0.2, random_state=42, stratify=y
+    )
+
+    if algorithm == "Random Forest":
+        model = RandomForestClassifier(
+            n_estimators=n_estimators, max_depth=max_depth, random_state=42, n_jobs=-1
+        )
+    else:
+        model = DecisionTreeClassifier(random_state=42, max_depth=max_depth)
+
+    model.fit(X_train, y_train)
+
+    y_pred = model.predict(X_test)
+    y_prob = model.predict_proba(X_test)[:, 1]
+
+    metrics = {
+        "accuracy": accuracy_score(y_test, y_pred),
+        "precision": precision_score(y_test, y_pred),
+        "recall": recall_score(y_test, y_pred),
+        "f1": f1_score(y_test, y_pred),
+        "roc_auc": roc_auc_score(y_test, y_prob),
+    }
+
+    return {
+        "model": model,
+        "encoders": encoders,
+        "feature_names": selected_features,
+        "X_test": X_test,
+        "y_test": y_test,
+        "y_pred": y_pred,
+        "y_prob": y_prob,
+        "metrics": metrics,
+        "source": "live",
+        "missing_report": missing_report,
+    }
+
+
+@st.cache_data
+def compute_feature_ranking(df: pd.DataFrame, feature_pool: tuple):
+    """Quick baseline Decision Tree over every available feature, used only to
+    rank features by importance for the sidebar's feature-selection UI."""
+    work = df.drop(columns=[c for c in DROP_COLS if c in df.columns]).copy()
+    work, _ = impute_missing(work)
+    for col in work.select_dtypes(include="object").columns:
+        work[col] = LabelEncoder().fit_transform(work[col])
+    X = work[list(feature_pool)]
+    y = work["Attrition"]
+    baseline = DecisionTreeClassifier(random_state=42, max_depth=6)
+    baseline.fit(X, y)
+    importances = pd.Series(baseline.feature_importances_, index=feature_pool)
+    return importances.sort_values(ascending=False)
+
+
+# ----------------------------------------------------------------------------
+# SCORING (predict Attrition for a dataset that doesn't have it)
+# ----------------------------------------------------------------------------
+def score_dataset(raw_df: pd.DataFrame, train_df: pd.DataFrame, bundle: dict):
+    """Run bundle's model over raw_df (which may be missing columns / have
+    unseen categories) and return raw_df with a predicted attrition column added
+    (named 'Attrition' if the input didn't already have one, so the output reads
+    like a normal attrition dataset; 'Predicted_Attrition' otherwise, to sit
+    alongside the real 'Attrition' column for comparison), plus a list of notes
+    describing any filling/mapping that had to happen."""
+    feature_names = bundle["feature_names"]
+    encoders = bundle["encoders"]
+    model = bundle["model"]
+    notes = []
+
+    work = raw_df.copy()
+
+    # Columns the model needs but this dataset doesn't have at all -> fill
+    # with a training-set default so we can still score every row.
+    for col in feature_names:
+        if col not in work.columns:
+            if col in encoders:
+                fill_val = train_df[col].mode(dropna=True).iloc[0]
+            else:
+                fill_val = train_df[col].median()
+            work[col] = fill_val
+            notes.append(f"Column '{col}' missing from uploaded file — filled with training default ({fill_val}).")
+
+    # Missing values within columns that ARE present.
+    present_features = [c for c in feature_names if c in raw_df.columns]
+    if present_features:
+        sub, missing_here = impute_missing(work[present_features].copy())
+        work[present_features] = sub
+        for col, cnt in missing_here.items():
+            notes.append(f"{cnt} missing value(s) in '{col}' filled with median/mode.")
+
+    # Encode categoricals; map any category the model has never seen to the
+    # most common training category instead of crashing.
+    for col, le in encoders.items():
+        if col not in feature_names:
+            continue
+        known = set(le.classes_)
+        col_as_str = work[col].astype(str)
+        unseen_mask = ~col_as_str.isin(known)
+        n_unseen = int(unseen_mask.sum())
+        if n_unseen:
+            col_as_str = col_as_str.where(~unseen_mask, le.classes_[0])
+            notes.append(f"{n_unseen} unseen value(s) in '{col}' mapped to '{le.classes_[0]}'.")
+        work[col] = le.transform(col_as_str)
+
+    X_score = work[feature_names]
+    preds = model.predict(X_score)
+    probs = model.predict_proba(X_score)[:, 1]
+
+    out = raw_df.copy()
+    label_col = "Attrition" if "Attrition" not in raw_df.columns else "Predicted_Attrition"
+    out[label_col] = np.where(preds == 1, "Yes", "No")
+    out["Attrition_Probability_%"] = (probs * 100).round(1)
+    return out, notes
+
+
+# ----------------------------------------------------------------------------
+# EXCEL REPORT
+# ----------------------------------------------------------------------------
+def generate_excel_report(data_source, df, algorithm, max_depth, n_estimators,
+                           missing_expected, missing_report, bundle, ranked_importance,
+                           scoring_df=None, scoring_notes=None, train_df=None):
+    buffer = io.BytesIO()
+
+    # Compute predictions once, up front, so the Summary sheet can reference the count.
+    if scoring_df is not None:
+        pred_out, score_notes = score_dataset(scoring_df, train_df, bundle)
+    else:
+        pred_out, score_notes = score_dataset(df, df, bundle)
+        pred_out.rename(columns={"Attrition": "Actual_Attrition"} if "Attrition" in pred_out.columns else {}, inplace=True)
+
+    predicted_col = "Predicted_Attrition" if "Predicted_Attrition" in pred_out.columns else "Attrition"
+    leaving_df = pred_out[pred_out[predicted_col] == "Yes"].sort_values(
+        "Attrition_Probability_%", ascending=False
+    )
+
+    with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
+
+        # --- Summary sheet ---------------------------------------------------
+        summary_rows = [
+            ("Report generated", datetime.now().strftime("%Y-%m-%d %H:%M")),
+            ("Dataset source", data_source),
+            ("Rows", len(df)),
+            ("Columns", df.shape[1]),
+        ]
+        if "Attrition" in df.columns:
+            summary_rows.append(("Attrition rate", f"{(df['Attrition'] == 'Yes').mean()*100:.1f}%"))
+        summary_rows += [
+            ("Algorithm", algorithm),
+            ("Max depth", max_depth),
+        ]
+        if algorithm == "Random Forest":
+            summary_rows.append(("Number of trees", n_estimators))
+        summary_rows.append(("Features used", len(bundle["feature_names"])))
+        summary_rows.append(("Features used (list)", ", ".join(bundle["feature_names"])))
+        if missing_expected:
+            summary_rows.append(("Standard features not in dataset", ", ".join(missing_expected)))
+        summary_rows.append(("Employees predicted to leave", f"{len(leaving_df)} of {len(pred_out)}"
+                              f" ({len(leaving_df)/len(pred_out)*100:.1f}%) — see 'Employees Leaving' sheet"))
+        if scoring_df is not None:
+            summary_rows.append(("Note", "Uploaded file had no 'Attrition' column — model was trained on the "
+                                          "bundled dataset and used to predict Attrition for your uploaded rows "
+                                          "(see 'Predictions' sheet)."))
+        pd.DataFrame(summary_rows, columns=["Field", "Value"]).to_excel(writer, sheet_name="Summary", index=False)
+
+        # --- Metrics sheet -----------------------------------------------------
+        m = bundle["metrics"]
+        cm = confusion_matrix(bundle["y_test"], bundle["y_pred"])
+        metrics_rows = [
+            ("Accuracy", f"{m['accuracy']*100:.2f}%"),
+            ("Precision", f"{m['precision']*100:.2f}%"),
+            ("Recall", f"{m['recall']*100:.2f}%"),
+            ("F1 Score", f"{m['f1']*100:.2f}%"),
+            ("ROC-AUC", f"{m['roc_auc']:.3f}"),
+            ("True Negatives", int(cm[0][0])),
+            ("False Positives", int(cm[0][1])),
+            ("False Negatives", int(cm[1][0])),
+            ("True Positives", int(cm[1][1])),
+        ]
+        pd.DataFrame(metrics_rows, columns=["Metric", "Value"]).to_excel(writer, sheet_name="Metrics", index=False)
+
+        # --- Feature importance sheet ------------------------------------------
+        total = ranked_importance.sum() or 1
+        fi_df = pd.DataFrame({
+            "Rank": range(1, len(ranked_importance) + 1),
+            "Feature": ranked_importance.index,
+            "Importance %": (ranked_importance.values / total * 100).round(2),
+            "Used in current model": [f in bundle["feature_names"] for f in ranked_importance.index],
+        })
+        fi_df.to_excel(writer, sheet_name="Feature Importance", index=False)
+
+        # --- Missing values sheet (only if relevant) ---------------------------
+        if missing_report:
+            miss_df = pd.DataFrame(
+                [(c, n, f"{n/len(df)*100:.1f}%") for c, n in missing_report.items()],
+                columns=["Column", "Missing Count", "% of Rows"],
+            )
+            miss_df.to_excel(writer, sheet_name="Missing Values", index=False)
+
+        # --- Predictions sheet ---------------------------------------------------
+        pred_out.to_excel(writer, sheet_name="Predictions", index=False)
+        if scoring_df is not None and (scoring_notes or score_notes):
+            pd.DataFrame((scoring_notes or []) + score_notes, columns=["Note"]).to_excel(
+                writer, sheet_name="Scoring Notes", index=False
+            )
+
+        # --- Employees Leaving sheet (filtered to predicted Yes) ------------------
+        leaving_df.to_excel(writer, sheet_name="Employees Leaving", index=False)
+
+    return buffer.getvalue()
+
+
+# ----------------------------------------------------------------------------
+# SIDEBAR: dataset
+# ----------------------------------------------------------------------------
+st.sidebar.title("📁 Dataset")
+uploaded_file = st.sidebar.file_uploader(
+    "Upload your own CSV (optional)", type=["csv"],
+    help="If it includes an 'Attrition' Yes/No column, it's used to train and evaluate the model. "
+         "If it doesn't, the model trains on the bundled dataset instead and predicts Attrition for "
+         "your uploaded rows — download the Excel report to get it back with that column added.",
+)
+
+missing_expected = []
+scoring_df = None  # set when the upload has no Attrition column: to be scored, not trained on
+if uploaded_file is not None:
+    try:
+        user_df = pd.read_csv(uploaded_file)
+        if "Attrition" not in user_df.columns:
+            scoring_df = user_df
+            df_raw = load_default_data()
+            data_source = f"bundled dataset (training) — '{uploaded_file.name}' has no Attrition column, used for scoring"
+            st.sidebar.warning(
+                f"'{uploaded_file.name}' has no 'Attrition' column, so it can't be used to train/evaluate. "
+                "Training on the bundled dataset instead — download the Excel report to get your file back "
+                "with a predicted Attrition column added."
+            )
+        else:
+            df_raw = user_df
+            data_source = f"uploaded file: {uploaded_file.name}"
+            missing_expected = [c for c in EXPECTED_FEATURES if c not in df_raw.columns]
+            if missing_expected:
+                st.sidebar.warning(
+                    f"{len(missing_expected)} standard feature(s) not in this file — "
+                    "they're simply excluded from selection:\n\n"
+                    + ", ".join(missing_expected)
+                )
+            extra_cols = [c for c in df_raw.columns if c not in EXPECTED_FEATURES + ["Attrition"] + DROP_COLS]
+            if extra_cols:
+                st.sidebar.success(f"{len(extra_cols)} extra column(s) found and available: " + ", ".join(extra_cols))
+    except Exception as e:
+        st.sidebar.error(f"Couldn't read that file ({e}) — using the bundled dataset instead.")
+        df_raw = load_default_data()
+        data_source = "bundled dataset (upload failed to parse)"
+else:
+    df_raw = load_default_data()
+    data_source = "bundled dataset (WA_Fn-UseC_-HR-Employee-Attrition.csv)"
+
+ALL_FEATURES = [c for c in df_raw.columns if c not in DROP_COLS + ["Attrition"]]
+if len(ALL_FEATURES) < 2:
+    st.error("This dataset doesn't have enough usable feature columns to train on.")
+    st.stop()
+
+total_missing_cells = int(df_raw[ALL_FEATURES + ["Attrition"]].isna().sum().sum())
+if total_missing_cells > 0:
+    st.sidebar.info(f"{total_missing_cells} missing cell(s) detected — will be auto-imputed "
+                     "(median for numeric, mode for categorical) before training.")
+
+# ----------------------------------------------------------------------------
+# SIDEBAR: model configuration
+# ----------------------------------------------------------------------------
+st.sidebar.markdown("---")
+st.sidebar.title("⚙️ Model Configuration")
+
+algorithm = st.sidebar.selectbox("Algorithm", ["Decision Tree", "Random Forest"])
+
+if algorithm == "Random Forest":
+    n_estimators = st.sidebar.slider("Number of trees (n_estimators)", 50, 500, 200, step=50)
+else:
+    n_estimators = 200  # unused for Decision Tree, kept for a stable cache key
+
+max_depth = st.sidebar.slider("Max tree depth", 2, 20, 5)
+
+st.sidebar.markdown("---")
+st.sidebar.markdown("### Feature Selection (ranked by importance)")
+
+ranked_importance = compute_feature_ranking(df_raw, tuple(ALL_FEATURES))
+ranked_features = ranked_importance.index.tolist()
+_total_imp = ranked_importance.sum() or 1
+feature_labels = {
+    f: f"{i+1}. {f} ({ranked_importance[f]/_total_imp*100:.1f}%)"
+    for i, f in enumerate(ranked_features)
+}
+label_to_feature = {v: k for k, v in feature_labels.items()}
+
+select_all = st.sidebar.checkbox("Select all features", value=True)
+if select_all:
+    selected_features = ranked_features
+else:
+    default_labels = [feature_labels[f] for f in ranked_features[:8]]
+    chosen_labels = st.sidebar.multiselect(
+        "Choose features to train on (most important first)",
+        options=[feature_labels[f] for f in ranked_features],
+        default=default_labels,
+    )
+    selected_features = [label_to_feature[l] for l in chosen_labels]
+
+with st.sidebar.expander("View full importance ranking"):
+    st.dataframe(
+        (ranked_importance / _total_imp * 100).round(1).rename("Importance %").reset_index().rename(columns={"index": "Feature"}),
+        use_container_width=True, height=300,
+    )
+
+if len(selected_features) < 2:
+    st.sidebar.error("Select at least 2 features to train a model.")
+    st.stop()
+
+using_bundled_for_training = uploaded_file is None or scoring_df is not None
+pretrained = _load_pretrained(df_raw, selected_features, algorithm, max_depth) if using_bundled_for_training else None
+if pretrained is not None:
+    bundle = pretrained
+    st.sidebar.success("Using model trained by train.py")
+else:
+    bundle = train_model(
+        df_raw, tuple(selected_features), algorithm,
+        max_depth=max_depth, n_estimators=n_estimators,
+    )
+    st.sidebar.info(f"Trained live: {algorithm}, depth={max_depth}"
+                     + (f", trees={n_estimators}" if algorithm == "Random Forest" else "")
+                     + f", {len(selected_features)} features")
+
+st.sidebar.markdown("---")
+st.sidebar.markdown("### Filter data (EDA tab)")
+dept_filter = st.sidebar.multiselect(
+    "Department", options=sorted(df_raw["Department"].unique()) if has_col(df_raw, "Department") else [],
+    default=None, disabled=not has_col(df_raw, "Department"),
+)
+gender_filter = st.sidebar.multiselect(
+    "Gender", options=sorted(df_raw["Gender"].unique()) if has_col(df_raw, "Gender") else [],
+    default=None, disabled=not has_col(df_raw, "Gender"),
+)
+
+df = df_raw.copy()
+if dept_filter:
+    df = df[df["Department"].isin(dept_filter)]
+if gender_filter:
+    df = df[df["Gender"].isin(gender_filter)]
+
+st.sidebar.markdown("---")
+st.sidebar.caption(data_source)
+
+# ----------------------------------------------------------------------------
+# HEADER
+# ----------------------------------------------------------------------------
+st.title("📊 Employee Attrition Analytics Dashboard")
+st.caption("Explore workforce attrition patterns, model performance, and predict attrition risk for individual employees.")
+
+tab_overview, tab_eda, tab_model, tab_predict = st.tabs(
+    ["🏠 Overview", "🔍 Explore Data", "🤖 Model Performance", "🎯 Predict Attrition"]
+)
+
+# ----------------------------------------------------------------------------
+# TAB 1: OVERVIEW
+# ----------------------------------------------------------------------------
+with tab_overview:
+    total_emp = len(df)
+    attr_rate = (df["Attrition"] == "Yes").mean() * 100
+
+    kpi_cols = st.columns(5)
+    kpi_cols[0].metric("Total Employees", f"{total_emp:,}")
+    kpi_cols[1].metric("Attrition Rate", f"{attr_rate:.1f}%")
+    if has_col(df, "Age"):
+        kpi_cols[2].metric("Avg. Age", f"{df['Age'].mean():.1f} yrs")
+    if has_col(df, "MonthlyIncome"):
+        kpi_cols[3].metric("Avg. Monthly Income", f"${df['MonthlyIncome'].mean():,.0f}")
+    if has_col(df, "YearsAtCompany"):
+        kpi_cols[4].metric("Avg. Tenure", f"{df['YearsAtCompany'].mean():.1f} yrs")
+
+    st.markdown("---")
+
+    col1, col2 = st.columns(2)
+    with col1:
+        fig = px.pie(
+            df, names="Attrition", title="Attrition Split",
+            color="Attrition", color_discrete_map={"No": "#2E86AB", "Yes": "#E63946"},
+            hole=0.45,
+        )
+        st.plotly_chart(fig, use_container_width=True)
+
+    with col2:
+        if has_col(df, "Department"):
+            dept_attr = (
+                df.groupby("Department")["Attrition"]
+                .apply(lambda s: (s == "Yes").mean() * 100)
+                .reset_index(name="AttritionRate")
+            )
+            fig = px.bar(
+                dept_attr, x="Department", y="AttritionRate",
+                title="Attrition Rate by Department (%)", text_auto=".1f",
+                color="AttritionRate", color_continuous_scale="Reds",
+            )
+            st.plotly_chart(fig, use_container_width=True)
+        else:
+            st.info("No 'Department' column in this dataset.")
+
+    col3, col4 = st.columns(2)
+    with col3:
+        if has_col(df, "OverTime"):
+            ot_attr = (
+                df.groupby("OverTime")["Attrition"]
+                .apply(lambda s: (s == "Yes").mean() * 100)
+                .reset_index(name="AttritionRate")
+            )
+            fig = px.bar(
+                ot_attr, x="OverTime", y="AttritionRate", color="OverTime",
+                title="Attrition Rate: OverTime vs No OverTime (%)", text_auto=".1f",
+            )
+            st.plotly_chart(fig, use_container_width=True)
+        else:
+            st.info("No 'OverTime' column in this dataset.")
+
+    with col4:
+        if has_col(df, "Age"):
+            fig = px.histogram(
+                df, x="Age", color="Attrition", barmode="overlay", nbins=25,
+                title="Age Distribution by Attrition",
+                color_discrete_map={"No": "#2E86AB", "Yes": "#E63946"},
+            )
+            st.plotly_chart(fig, use_container_width=True)
+        else:
+            st.info("No 'Age' column in this dataset.")
+
+    if total_missing_cells > 0:
+        st.markdown("---")
+        st.markdown("#### Data Quality — Missing Values")
+        miss_counts = df_raw[ALL_FEATURES + ["Attrition"]].isna().sum()
+        miss_counts = miss_counts[miss_counts > 0].sort_values(ascending=False)
+        fig = px.bar(miss_counts, title="Missing Values by Column", labels={"value": "Missing count", "index": "Column"})
+        st.plotly_chart(fig, use_container_width=True)
+
+# ----------------------------------------------------------------------------
+# TAB 2: EXPLORE DATA
+# ----------------------------------------------------------------------------
+with tab_eda:
+    st.subheader("Interactive Exploration")
+
+    numeric_cols = df.select_dtypes(include=np.number).columns.tolist()
+    numeric_cols = [c for c in numeric_cols if c not in ["EmployeeCount", "EmployeeNumber", "StandardHours"]]
+    cat_cols = df.select_dtypes(include="object").columns.tolist()
+    cat_cols = [c for c in cat_cols if c != "Attrition"]
+
+    if numeric_cols and cat_cols:
+        colx, coly = st.columns(2)
+        with colx:
+            x_axis = st.selectbox("X-axis (numeric)", numeric_cols, index=numeric_cols.index("MonthlyIncome") if "MonthlyIncome" in numeric_cols else 0)
+        with coly:
+            split_by = st.selectbox("Split by (category)", cat_cols, index=cat_cols.index("JobRole") if "JobRole" in cat_cols else 0)
+
+        fig = px.box(
+            df, x=split_by, y=x_axis, color="Attrition",
+            title=f"{x_axis} by {split_by} and Attrition",
+            color_discrete_map={"No": "#2E86AB", "Yes": "#E63946"},
+        )
+        fig.update_layout(xaxis_tickangle=-30)
+        st.plotly_chart(fig, use_container_width=True)
+    else:
+        st.info("Need at least one numeric and one categorical column for this chart.")
+
+    st.markdown("---")
+    col5, col6 = st.columns(2)
+    with col5:
+        if has_col(df, "JobSatisfaction"):
+            fig = px.histogram(
+                df, x="JobSatisfaction", color="Attrition", barmode="group",
+                title="Job Satisfaction vs Attrition",
+                color_discrete_map={"No": "#2E86AB", "Yes": "#E63946"},
+            )
+            st.plotly_chart(fig, use_container_width=True)
+        else:
+            st.info("No 'JobSatisfaction' column in this dataset.")
+    with col6:
+        if has_col(df, "WorkLifeBalance"):
+            fig = px.histogram(
+                df, x="WorkLifeBalance", color="Attrition", barmode="group",
+                title="Work-Life Balance vs Attrition",
+                color_discrete_map={"No": "#2E86AB", "Yes": "#E63946"},
+            )
+            st.plotly_chart(fig, use_container_width=True)
+        else:
+            st.info("No 'WorkLifeBalance' column in this dataset.")
+
+    if len(numeric_cols) >= 2:
+        st.markdown("---")
+        st.markdown("#### Correlation Heatmap (numeric features)")
+        corr = df[numeric_cols].corr()
+        fig = px.imshow(corr, color_continuous_scale="RdBu_r", zmin=-1, zmax=1, aspect="auto")
+        st.plotly_chart(fig, use_container_width=True)
+
+    st.markdown("---")
+    st.markdown("#### Raw Data")
+    st.dataframe(df, use_container_width=True, height=350)
+
+# ----------------------------------------------------------------------------
+# TAB 3: MODEL PERFORMANCE
+# ----------------------------------------------------------------------------
+with tab_model:
+    m = bundle["metrics"]
+    st.subheader(f"{algorithm} Performance")
+    st.caption(
+        f"Trained on 80/20 split using {len(bundle['feature_names'])} feature(s), "
+        f"max_depth={max_depth}"
+        + (f", n_estimators={n_estimators}" if algorithm == "Random Forest" else "")
+        + ". Adjust in the sidebar."
+    )
+
+    c1, c2, c3, c4, c5 = st.columns(5)
+    c1.metric("Accuracy", f"{m['accuracy']*100:.1f}%")
+    c2.metric("Precision", f"{m['precision']*100:.1f}%")
+    c3.metric("Recall", f"{m['recall']*100:.1f}%")
+    c4.metric("F1 Score", f"{m['f1']*100:.1f}%")
+    c5.metric("ROC-AUC", f"{m['roc_auc']:.3f}")
+
+    st.markdown("---")
+    col1, col2 = st.columns(2)
+
+    with col1:
+        cm = confusion_matrix(bundle["y_test"], bundle["y_pred"])
+        fig = px.imshow(
+            cm, text_auto=True, color_continuous_scale="Blues",
+            labels=dict(x="Predicted", y="Actual", color="Count"),
+            x=["No", "Yes"], y=["No", "Yes"],
+            title="Confusion Matrix",
+        )
+        st.plotly_chart(fig, use_container_width=True)
+
+    with col2:
+        fpr, tpr, _ = roc_curve(bundle["y_test"], bundle["y_prob"])
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(x=fpr, y=tpr, name=f"ROC (AUC={m['roc_auc']:.3f})"))
+        fig.add_trace(go.Scatter(x=[0, 1], y=[0, 1], line=dict(dash="dash"), name="Random"))
+        fig.update_layout(title="ROC Curve", xaxis_title="False Positive Rate", yaxis_title="True Positive Rate")
+        st.plotly_chart(fig, use_container_width=True)
+
+    col3, col4 = st.columns(2)
+    with col3:
+        precision_c, recall_c, _ = precision_recall_curve(bundle["y_test"], bundle["y_prob"])
+        pr_auc = auc(recall_c, precision_c)
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(x=recall_c, y=precision_c, name=f"PR (AUC={pr_auc:.3f})"))
+        fig.update_layout(title="Precision-Recall Curve", xaxis_title="Recall", yaxis_title="Precision")
+        st.plotly_chart(fig, use_container_width=True)
+
+    with col4:
+        fi = pd.Series(bundle["model"].feature_importances_, index=bundle["feature_names"])
+        fi = fi.sort_values(ascending=False).head(15)
+        fig = px.bar(
+            fi[::-1], orientation="h",
+            title="Top Feature Importances (current model)",
+            labels={"value": "Importance", "index": "Feature"},
+        )
+        st.plotly_chart(fig, use_container_width=True)
+
+    if bundle.get("missing_report"):
+        st.markdown("---")
+        st.markdown("#### Missing Values Imputed Before Training")
+        miss_df = pd.DataFrame(
+            [(c, n, f"{n/len(df_raw)*100:.1f}%") for c, n in bundle["missing_report"].items()],
+            columns=["Column", "Missing Count", "% of Rows"],
+        )
+        st.dataframe(miss_df, use_container_width=True)
+
+    st.markdown("---")
+    st.markdown("#### 📊 Download Report")
+    if scoring_df is not None:
+        st.caption(
+            "An Excel workbook with dataset summary, metrics, feature importance ranking, a "
+            "'Predictions' sheet containing your uploaded file with a predicted **Attrition** column added "
+            "(since it didn't have one), and an **Employees Leaving** sheet filtered to just those rows."
+        )
+    else:
+        st.caption(
+            "An Excel workbook with dataset summary, metrics, feature importance ranking, a "
+            "'Predictions' sheet (actual vs. predicted Attrition for every row), and an **Employees Leaving** "
+            "sheet filtered to just those predicted to leave."
+        )
+    excel_bytes = generate_excel_report(
+        data_source, df_raw, algorithm, max_depth, n_estimators,
+        missing_expected, bundle.get("missing_report", {}), bundle, ranked_importance,
+        scoring_df=scoring_df, train_df=df_raw,
+    )
+    st.download_button(
+        "📥 Download Excel Report", data=excel_bytes,
+        file_name=f"attrition_report_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        use_container_width=True,
+    )
+
+# ----------------------------------------------------------------------------
+# TAB 4: PREDICT (form built dynamically from the currently selected features)
+# ----------------------------------------------------------------------------
+with tab_predict:
+    st.subheader("Predict Attrition Risk for an Employee")
+    st.caption(
+        f"Form below reflects the {len(bundle['feature_names'])} feature(s) currently "
+        "selected in the sidebar, used by the trained model."
+    )
+
+    model = bundle["model"]
+    encoders = bundle["encoders"]
+    feature_names = bundle["feature_names"]
+
+    with st.form("predict_form"):
+        cols = st.columns(3)
+        raw_input = {}
+
+        for i, col in enumerate(feature_names):
+            target_col = cols[i % 3]
+            with target_col:
+                if col in encoders:  # categorical
+                    options = sorted(df_raw[col].dropna().unique().tolist())
+                    raw_input[col] = st.selectbox(col, options, index=0, key=f"in_{col}")
+                else:  # numeric
+                    series = df_raw[col].dropna()
+                    col_min = int(series.min())
+                    col_max = int(series.max())
+                    col_default = int(series.median())
+                    if col_min == col_max:
+                        col_max = col_min + 1
+                    raw_input[col] = st.slider(col, col_min, col_max, col_default, key=f"in_{col}")
+
+        submitted = st.form_submit_button("🔮 Predict", use_container_width=True)
+
+    if submitted:
+        input_df = pd.DataFrame([raw_input])
+        for col, le in encoders.items():
+            if col in input_df.columns:
+                input_df[col] = le.transform(input_df[col])
+
+        input_df = input_df[feature_names]
+        pred = model.predict(input_df)[0]
+        prob = model.predict_proba(input_df)[0][1]
+
+        st.markdown("---")
+        res1, res2 = st.columns([1, 2])
+        with res1:
+            if pred == 1:
+                st.error(f"⚠️ Likely to Leave\n\nAttrition Probability: **{prob*100:.1f}%**")
+            else:
+                st.success(f"✅ Likely to Stay\n\nAttrition Probability: **{prob*100:.1f}%**")
+        with res2:
+            fig = go.Figure(go.Indicator(
+                mode="gauge+number",
+                value=prob * 100,
+                title={"text": "Attrition Risk (%)"},
+                gauge={
+                    "axis": {"range": [0, 100]},
+                    "bar": {"color": "#E63946" if pred == 1 else "#2E86AB"},
+                    "steps": [
+                        {"range": [0, 33], "color": "#d4edda"},
+                        {"range": [33, 66], "color": "#fff3cd"},
+                        {"range": [66, 100], "color": "#f8d7da"},
+                    ],
+                },
+            ))
+            fig.update_layout(height=250, margin=dict(l=20, r=20, t=50, b=20))
+            st.plotly_chart(fig, use_container_width=True)
