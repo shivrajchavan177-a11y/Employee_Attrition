@@ -9,6 +9,7 @@ import plotly.graph_objects as go
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import LabelEncoder
 from sklearn.tree import DecisionTreeClassifier
+from sklearn.ensemble import RandomForestClassifier
 from sklearn.metrics import (
     confusion_matrix, accuracy_score, precision_score, recall_score,
     f1_score, roc_curve, roc_auc_score, precision_recall_curve, auc
@@ -38,10 +39,14 @@ def load_data():
     return df
 
 
-def _load_pretrained(df: pd.DataFrame):
-    """Load artifacts saved by train.py, if present. Returns None if missing/unusable."""
+def _load_pretrained(df: pd.DataFrame, selected_features, algorithm, max_depth):
+    """Use artifacts saved by train.py, but only when the sidebar selections match
+    exactly what train.py trained on (full default feature set, Decision Tree, depth 5).
+    Otherwise return None so the caller trains live instead."""
     required = ["model.pkl", "encoders.pkl", "feature_names.pkl"]
     if not all((MODEL_DIR / f).exists() for f in required):
+        return None
+    if algorithm != "Decision Tree" or max_depth != 5:
         return None
     try:
         with open(MODEL_DIR / "model.pkl", "rb") as f:
@@ -51,6 +56,9 @@ def _load_pretrained(df: pd.DataFrame):
         with open(MODEL_DIR / "feature_names.pkl", "rb") as f:
             feature_names = pickle.load(f)
     except Exception:
+        return None
+
+    if list(feature_names) != list(selected_features):
         return None
 
     work = df.drop(columns=[c for c in DROP_COLS if c in df.columns]).copy()
@@ -72,14 +80,17 @@ def _load_pretrained(df: pd.DataFrame):
     }
 
     return {
-        "model": model, "encoders": encoders, "feature_names": feature_names,
+        "model": model, "encoders": encoders, "feature_names": list(feature_names),
         "X_test": X_test, "y_test": y_test, "y_pred": y_pred, "y_prob": y_prob,
         "metrics": metrics, "source": "pretrained",
     }
 
 
 @st.cache_resource
-def train_model(df: pd.DataFrame, max_depth: int = 5):
+def train_model(df: pd.DataFrame, selected_features: tuple, algorithm: str,
+                 max_depth: int = 5, n_estimators: int = 200):
+    selected_features = list(selected_features)
+
     work = df.drop(columns=[c for c in DROP_COLS if c in df.columns]).copy()
 
     encoders = {}
@@ -88,14 +99,20 @@ def train_model(df: pd.DataFrame, max_depth: int = 5):
         work[col] = le.fit_transform(work[col])
         encoders[col] = le
 
-    X = work.drop("Attrition", axis=1)
+    X = work[selected_features]
     y = work["Attrition"]
 
     X_train, X_test, y_train, y_test = train_test_split(
         X, y, test_size=0.2, random_state=42, stratify=y
     )
 
-    model = DecisionTreeClassifier(random_state=42, max_depth=max_depth)
+    if algorithm == "Random Forest":
+        model = RandomForestClassifier(
+            n_estimators=n_estimators, max_depth=max_depth, random_state=42, n_jobs=-1
+        )
+    else:
+        model = DecisionTreeClassifier(random_state=42, max_depth=max_depth)
+
     model.fit(X_train, y_train)
 
     y_pred = model.predict(X_test)
@@ -112,7 +129,7 @@ def train_model(df: pd.DataFrame, max_depth: int = 5):
     return {
         "model": model,
         "encoders": encoders,
-        "feature_names": list(X.columns),
+        "feature_names": selected_features,
         "X_test": X_test,
         "y_test": y_test,
         "y_pred": y_pred,
@@ -123,21 +140,51 @@ def train_model(df: pd.DataFrame, max_depth: int = 5):
 
 
 df_raw = load_data()
-pretrained = _load_pretrained(df_raw)
 
-# Sidebar controls
-st.sidebar.title("⚙️ Controls")
-depth = st.sidebar.slider("Decision Tree max depth", 2, 15, 5, help="Moving this off 5 retrains the model live.")
+# Full pool of usable features (everything except the always-dropped ID-like
+# columns and the target itself).
+ALL_FEATURES = [c for c in df_raw.columns if c not in DROP_COLS + ["Attrition"]]
 
-if pretrained is not None and depth == 5:
+# ----------------------------------------------------------------------------
+# SIDEBAR: model configuration
+# ----------------------------------------------------------------------------
+st.sidebar.title("⚙️ Model Configuration")
+
+algorithm = st.sidebar.selectbox("Algorithm", ["Decision Tree", "Random Forest"])
+
+if algorithm == "Random Forest":
+    n_estimators = st.sidebar.slider("Number of trees (n_estimators)", 50, 500, 200, step=50)
+else:
+    n_estimators = 200  # unused for Decision Tree, kept for a stable cache key
+
+max_depth = st.sidebar.slider("Max tree depth", 2, 20, 5)
+
+st.sidebar.markdown("---")
+st.sidebar.markdown("### Feature Selection")
+select_all = st.sidebar.checkbox("Select all features", value=True)
+if select_all:
+    selected_features = ALL_FEATURES
+else:
+    selected_features = st.sidebar.multiselect(
+        "Choose features to train on", options=ALL_FEATURES, default=ALL_FEATURES[:8]
+    )
+
+if len(selected_features) < 2:
+    st.sidebar.error("Select at least 2 features to train a model.")
+    st.stop()
+
+pretrained = _load_pretrained(df_raw, selected_features, algorithm, max_depth)
+if pretrained is not None:
     bundle = pretrained
     st.sidebar.success("Using model trained by train.py")
 else:
-    bundle = train_model(df_raw, max_depth=depth)
-    if pretrained is None:
-        st.sidebar.info("No saved model found — training live. Run `python train.py` to persist a model.")
-    else:
-        st.sidebar.info(f"Retrained live for max_depth={depth}")
+    bundle = train_model(
+        df_raw, tuple(selected_features), algorithm,
+        max_depth=max_depth, n_estimators=n_estimators,
+    )
+    st.sidebar.info(f"Trained live: {algorithm}, depth={max_depth}"
+                     + (f", trees={n_estimators}" if algorithm == "Random Forest" else "")
+                     + f", {len(selected_features)} features")
 
 st.sidebar.markdown("---")
 st.sidebar.markdown("### Filter data (EDA tab)")
@@ -155,7 +202,7 @@ if gender_filter:
     df = df[df["Gender"].isin(gender_filter)]
 
 st.sidebar.markdown("---")
-st.sidebar.caption("Built with a Decision Tree Classifier on the IBM HR Analytics Employee Attrition dataset.")
+st.sidebar.caption("IBM HR Analytics Employee Attrition dataset.")
 
 # ----------------------------------------------------------------------------
 # HEADER
@@ -286,8 +333,13 @@ with tab_eda:
 # ----------------------------------------------------------------------------
 with tab_model:
     m = bundle["metrics"]
-    st.subheader("Decision Tree Classifier Performance")
-    st.caption(f"Trained live on 80/20 split, max_depth={depth} (adjust in the sidebar).")
+    st.subheader(f"{algorithm} Performance")
+    st.caption(
+        f"Trained on 80/20 split using {len(bundle['feature_names'])} feature(s), "
+        f"max_depth={max_depth}"
+        + (f", n_estimators={n_estimators}" if algorithm == "Random Forest" else "")
+        + ". Adjust in the sidebar."
+    )
 
     c1, c2, c3, c4, c5 = st.columns(5)
     c1.metric("Accuracy", f"{m['accuracy']*100:.1f}%")
@@ -331,85 +383,47 @@ with tab_model:
         fi = fi.sort_values(ascending=False).head(15)
         fig = px.bar(
             fi[::-1], orientation="h",
-            title="Top 15 Feature Importances",
+            title="Top Feature Importances",
             labels={"value": "Importance", "index": "Feature"},
         )
         st.plotly_chart(fig, use_container_width=True)
 
 # ----------------------------------------------------------------------------
-# TAB 4: PREDICT
+# TAB 4: PREDICT (form built dynamically from the currently selected features)
 # ----------------------------------------------------------------------------
 with tab_predict:
     st.subheader("Predict Attrition Risk for an Employee")
-    st.caption("Fill in the employee's details and get a live prediction from the trained model.")
+    st.caption(
+        f"Form below reflects the {len(bundle['feature_names'])} feature(s) currently "
+        "selected in the sidebar, used by the trained model."
+    )
 
     model = bundle["model"]
     encoders = bundle["encoders"]
     feature_names = bundle["feature_names"]
 
     with st.form("predict_form"):
-        f1, f2, f3 = st.columns(3)
+        cols = st.columns(3)
+        raw_input = {}
 
-        with f1:
-            age = st.slider("Age", 18, 60, 30)
-            business_travel = st.selectbox("Business Travel", sorted(df_raw["BusinessTravel"].unique()))
-            department = st.selectbox("Department", sorted(df_raw["Department"].unique()))
-            distance = st.slider("Distance From Home", 1, 29, 5)
-            education = st.slider("Education (1-5)", 1, 5, 3)
-            education_field = st.selectbox("Education Field", sorted(df_raw["EducationField"].unique()))
-            env_satisfaction = st.slider("Environment Satisfaction (1-4)", 1, 4, 3)
-            gender = st.selectbox("Gender", sorted(df_raw["Gender"].unique()))
-
-        with f2:
-            hourly_rate = st.slider("Hourly Rate", 30, 100, 65)
-            job_involvement = st.slider("Job Involvement (1-4)", 1, 4, 3)
-            job_level = st.slider("Job Level (1-5)", 1, 5, 2)
-            job_role = st.selectbox("Job Role", sorted(df_raw["JobRole"].unique()))
-            job_satisfaction = st.slider("Job Satisfaction (1-4)", 1, 4, 3)
-            marital_status = st.selectbox("Marital Status", sorted(df_raw["MaritalStatus"].unique()))
-            monthly_income = st.number_input("Monthly Income", 1000, 20000, 5000, step=100)
-            monthly_rate = st.number_input("Monthly Rate", 2000, 27000, 14000, step=100)
-
-        with f3:
-            num_companies = st.slider("Num Companies Worked", 0, 9, 2)
-            overtime = st.selectbox("OverTime", sorted(df_raw["OverTime"].unique()))
-            percent_hike = st.slider("Percent Salary Hike", 11, 25, 15)
-            performance_rating = st.slider("Performance Rating (3-4)", 3, 4, 3)
-            relationship_satisfaction = st.slider("Relationship Satisfaction (1-4)", 1, 4, 3)
-            stock_option = st.slider("Stock Option Level (0-3)", 0, 3, 1)
-            total_working_years = st.slider("Total Working Years", 0, 40, 8)
-            training_times = st.slider("Training Times Last Year", 0, 6, 2)
-
-        f4, f5 = st.columns(2)
-        with f4:
-            work_life_balance = st.slider("Work Life Balance (1-4)", 1, 4, 3)
-            years_at_company = st.slider("Years At Company", 0, 40, 5)
-        with f5:
-            years_in_role = st.slider("Years In Current Role", 0, 18, 3)
-            years_since_promotion = st.slider("Years Since Last Promotion", 0, 15, 1)
-            years_with_manager = st.slider("Years With Current Manager", 0, 17, 3)
+        for i, col in enumerate(feature_names):
+            target_col = cols[i % 3]
+            with target_col:
+                if col in encoders:  # categorical
+                    options = sorted(df_raw[col].unique().tolist())
+                    default_idx = 0
+                    raw_input[col] = st.selectbox(col, options, index=default_idx, key=f"in_{col}")
+                else:  # numeric
+                    col_min = int(df_raw[col].min())
+                    col_max = int(df_raw[col].max())
+                    col_default = int(df_raw[col].median())
+                    if col_min == col_max:
+                        col_max = col_min + 1
+                    raw_input[col] = st.slider(col, col_min, col_max, col_default, key=f"in_{col}")
 
         submitted = st.form_submit_button("🔮 Predict", use_container_width=True)
 
     if submitted:
-        raw_input = {
-            "Age": age, "BusinessTravel": business_travel, "DailyRate": 800,
-            "Department": department, "DistanceFromHome": distance, "Education": education,
-            "EducationField": education_field, "EnvironmentSatisfaction": env_satisfaction,
-            "Gender": gender, "HourlyRate": hourly_rate, "JobInvolvement": job_involvement,
-            "JobLevel": job_level, "JobRole": job_role, "JobSatisfaction": job_satisfaction,
-            "MaritalStatus": marital_status, "MonthlyIncome": monthly_income,
-            "MonthlyRate": monthly_rate, "NumCompaniesWorked": num_companies,
-            "OverTime": overtime, "PercentSalaryHike": percent_hike,
-            "PerformanceRating": performance_rating,
-            "RelationshipSatisfaction": relationship_satisfaction,
-            "StockOptionLevel": stock_option, "TotalWorkingYears": total_working_years,
-            "TrainingTimesLastYear": training_times, "WorkLifeBalance": work_life_balance,
-            "YearsAtCompany": years_at_company, "YearsInCurrentRole": years_in_role,
-            "YearsSinceLastPromotion": years_since_promotion,
-            "YearsWithCurrManager": years_with_manager,
-        }
-
         input_df = pd.DataFrame([raw_input])
         for col, le in encoders.items():
             if col in input_df.columns:
