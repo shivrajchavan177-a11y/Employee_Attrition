@@ -1,3 +1,4 @@
+import io
 import pickle
 from datetime import datetime
 from pathlib import Path
@@ -15,7 +16,6 @@ from sklearn.metrics import (
     confusion_matrix, accuracy_score, precision_score, recall_score,
     f1_score, roc_curve, roc_auc_score, precision_recall_curve, auc
 )
-from fpdf import FPDF
 
 # ----------------------------------------------------------------------------
 # PAGE CONFIG
@@ -199,95 +199,145 @@ def compute_feature_ranking(df: pd.DataFrame, feature_pool: tuple):
 
 
 # ----------------------------------------------------------------------------
-# PDF REPORT
+# SCORING (predict Attrition for a dataset that doesn't have it)
 # ----------------------------------------------------------------------------
-def _pdf_safe(text: str) -> str:
-    """fpdf2's default core font (Helvetica) only supports latin-1. Replace common
-    unicode punctuation and drop anything else it can't encode, so arbitrary
-    column names / uploaded file names never crash report generation."""
-    if not isinstance(text, str):
-        text = str(text)
-    replacements = {
-        "—": "-", "–": "-", "’": "'", "‘": "'", "“": '"', "”": '"', "…": "...",
-    }
-    for bad, good in replacements.items():
-        text = text.replace(bad, good)
-    return text.encode("latin-1", "replace").decode("latin-1")
+def score_dataset(raw_df: pd.DataFrame, train_df: pd.DataFrame, bundle: dict):
+    """Run bundle's model over raw_df (which may be missing columns / have
+    unseen categories) and return raw_df with Predicted_Attrition and
+    Attrition_Probability_% columns added, plus a list of notes describing
+    any filling/mapping that had to happen."""
+    feature_names = bundle["feature_names"]
+    encoders = bundle["encoders"]
+    model = bundle["model"]
+    notes = []
+
+    work = raw_df.copy()
+
+    # Columns the model needs but this dataset doesn't have at all -> fill
+    # with a training-set default so we can still score every row.
+    for col in feature_names:
+        if col not in work.columns:
+            if col in encoders:
+                fill_val = train_df[col].mode(dropna=True).iloc[0]
+            else:
+                fill_val = train_df[col].median()
+            work[col] = fill_val
+            notes.append(f"Column '{col}' missing from uploaded file — filled with training default ({fill_val}).")
+
+    # Missing values within columns that ARE present.
+    present_features = [c for c in feature_names if c in raw_df.columns]
+    if present_features:
+        sub, missing_here = impute_missing(work[present_features].copy())
+        work[present_features] = sub
+        for col, cnt in missing_here.items():
+            notes.append(f"{cnt} missing value(s) in '{col}' filled with median/mode.")
+
+    # Encode categoricals; map any category the model has never seen to the
+    # most common training category instead of crashing.
+    for col, le in encoders.items():
+        if col not in feature_names:
+            continue
+        known = set(le.classes_)
+        col_as_str = work[col].astype(str)
+        unseen_mask = ~col_as_str.isin(known)
+        n_unseen = int(unseen_mask.sum())
+        if n_unseen:
+            col_as_str = col_as_str.where(~unseen_mask, le.classes_[0])
+            notes.append(f"{n_unseen} unseen value(s) in '{col}' mapped to '{le.classes_[0]}'.")
+        work[col] = le.transform(col_as_str)
+
+    X_score = work[feature_names]
+    preds = model.predict(X_score)
+    probs = model.predict_proba(X_score)[:, 1]
+
+    out = raw_df.copy()
+    out["Predicted_Attrition"] = np.where(preds == 1, "Yes", "No")
+    out["Attrition_Probability_%"] = (probs * 100).round(1)
+    return out, notes
 
 
-def generate_pdf_report(data_source, df, algorithm, max_depth, n_estimators,
-                         missing_expected, missing_report, bundle, ranked_importance):
-    pdf = FPDF()
-    pdf.set_auto_page_break(auto=True, margin=15)
-    pdf.add_page()
+# ----------------------------------------------------------------------------
+# EXCEL REPORT
+# ----------------------------------------------------------------------------
+def generate_excel_report(data_source, df, algorithm, max_depth, n_estimators,
+                           missing_expected, missing_report, bundle, ranked_importance,
+                           scoring_df=None, scoring_notes=None, train_df=None):
+    buffer = io.BytesIO()
+    with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
 
-    pdf.set_font("Helvetica", "B", 16)
-    pdf.cell(0, 10, "Employee Attrition Analysis Report", ln=True)
-    pdf.set_font("Helvetica", "", 9)
-    pdf.set_text_color(100, 100, 100)
-    pdf.cell(0, 6, f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M')}", ln=True)
-    pdf.set_text_color(0, 0, 0)
-    pdf.ln(3)
+        # --- Summary sheet ---------------------------------------------------
+        summary_rows = [
+            ("Report generated", datetime.now().strftime("%Y-%m-%d %H:%M")),
+            ("Dataset source", data_source),
+            ("Rows", len(df)),
+            ("Columns", df.shape[1]),
+        ]
+        if "Attrition" in df.columns:
+            summary_rows.append(("Attrition rate", f"{(df['Attrition'] == 'Yes').mean()*100:.1f}%"))
+        summary_rows += [
+            ("Algorithm", algorithm),
+            ("Max depth", max_depth),
+        ]
+        if algorithm == "Random Forest":
+            summary_rows.append(("Number of trees", n_estimators))
+        summary_rows.append(("Features used", len(bundle["feature_names"])))
+        summary_rows.append(("Features used (list)", ", ".join(bundle["feature_names"])))
+        if missing_expected:
+            summary_rows.append(("Standard features not in dataset", ", ".join(missing_expected)))
+        if scoring_df is not None:
+            summary_rows.append(("Note", "Uploaded file had no 'Attrition' column — model was trained on the "
+                                          "bundled dataset and used to predict Attrition for your uploaded rows "
+                                          "(see 'Predictions' sheet)."))
+        pd.DataFrame(summary_rows, columns=["Field", "Value"]).to_excel(writer, sheet_name="Summary", index=False)
 
-    def section(title):
-        pdf.ln(2)
-        pdf.set_font("Helvetica", "B", 13)
-        pdf.cell(0, 8, _pdf_safe(title), ln=True)
-        pdf.set_font("Helvetica", "", 10)
+        # --- Metrics sheet -----------------------------------------------------
+        m = bundle["metrics"]
+        cm = confusion_matrix(bundle["y_test"], bundle["y_pred"])
+        metrics_rows = [
+            ("Accuracy", f"{m['accuracy']*100:.2f}%"),
+            ("Precision", f"{m['precision']*100:.2f}%"),
+            ("Recall", f"{m['recall']*100:.2f}%"),
+            ("F1 Score", f"{m['f1']*100:.2f}%"),
+            ("ROC-AUC", f"{m['roc_auc']:.3f}"),
+            ("True Negatives", int(cm[0][0])),
+            ("False Positives", int(cm[0][1])),
+            ("False Negatives", int(cm[1][0])),
+            ("True Positives", int(cm[1][1])),
+        ]
+        pd.DataFrame(metrics_rows, columns=["Metric", "Value"]).to_excel(writer, sheet_name="Metrics", index=False)
 
-    section("Dataset Summary")
-    pdf.cell(0, 6, _pdf_safe(f"Source: {data_source}"), ln=True)
-    pdf.cell(0, 6, f"Rows: {len(df)}    Columns: {df.shape[1]}", ln=True)
-    if "Attrition" in df.columns:
-        attr_rate = (df["Attrition"] == "Yes").mean() * 100
-        pdf.cell(0, 6, f"Attrition rate: {attr_rate:.1f}%", ln=True)
+        # --- Feature importance sheet ------------------------------------------
+        total = ranked_importance.sum() or 1
+        fi_df = pd.DataFrame({
+            "Rank": range(1, len(ranked_importance) + 1),
+            "Feature": ranked_importance.index,
+            "Importance %": (ranked_importance.values / total * 100).round(2),
+            "Used in current model": [f in bundle["feature_names"] for f in ranked_importance.index],
+        })
+        fi_df.to_excel(writer, sheet_name="Feature Importance", index=False)
 
-    if missing_expected:
-        pdf.ln(1)
-        pdf.set_font("Helvetica", "I", 9)
-        pdf.multi_cell(0, 5, _pdf_safe("Standard features not present in this dataset (skipped): "
-                              + ", ".join(missing_expected)))
-        pdf.set_font("Helvetica", "", 10)
+        # --- Missing values sheet (only if relevant) ---------------------------
+        if missing_report:
+            miss_df = pd.DataFrame(
+                [(c, n, f"{n/len(df)*100:.1f}%") for c, n in missing_report.items()],
+                columns=["Column", "Missing Count", "% of Rows"],
+            )
+            miss_df.to_excel(writer, sheet_name="Missing Values", index=False)
 
-    if missing_report:
-        pdf.ln(1)
-        pdf.set_font("Helvetica", "B", 11)
-        pdf.cell(0, 6, "Missing values filled (median/mode imputation):", ln=True)
-        pdf.set_font("Helvetica", "", 10)
-        for col, cnt in missing_report.items():
-            pct = cnt / len(df) * 100
-            pdf.cell(0, 5, _pdf_safe(f"  - {col}: {cnt} missing ({pct:.1f}%)"), ln=True)
+        # --- Predictions sheet ---------------------------------------------------
+        if scoring_df is not None:
+            pred_out, notes = score_dataset(scoring_df, train_df, bundle)
+            pred_out.to_excel(writer, sheet_name="Predictions", index=False)
+            if scoring_notes or notes:
+                pd.DataFrame((scoring_notes or []) + notes, columns=["Note"]).to_excel(
+                    writer, sheet_name="Scoring Notes", index=False
+                )
+        else:
+            pred_out, _ = score_dataset(df, df, bundle)
+            pred_out.rename(columns={"Attrition": "Actual_Attrition"} if "Attrition" in pred_out.columns else {}, inplace=True)
+            pred_out.to_excel(writer, sheet_name="Predictions", index=False)
 
-    section("Model Configuration")
-    pdf.cell(0, 6, f"Algorithm: {algorithm}", ln=True)
-    pdf.cell(0, 6, f"Max depth: {max_depth}", ln=True)
-    if algorithm == "Random Forest":
-        pdf.cell(0, 6, f"Number of trees: {n_estimators}", ln=True)
-    pdf.cell(0, 6, f"Features used: {len(bundle['feature_names'])}", ln=True)
-
-    section("Performance Metrics (on held-out test split)")
-    m = bundle["metrics"]
-    pdf.cell(0, 6, f"Accuracy:  {m['accuracy']*100:.2f}%", ln=True)
-    pdf.cell(0, 6, f"Precision: {m['precision']*100:.2f}%", ln=True)
-    pdf.cell(0, 6, f"Recall:    {m['recall']*100:.2f}%", ln=True)
-    pdf.cell(0, 6, f"F1 Score:  {m['f1']*100:.2f}%", ln=True)
-    pdf.cell(0, 6, f"ROC-AUC:   {m['roc_auc']:.3f}", ln=True)
-
-    cm = confusion_matrix(bundle["y_test"], bundle["y_pred"])
-    section("Confusion Matrix")
-    pdf.cell(0, 6, f"True Negatives:  {cm[0][0]}    False Positives: {cm[0][1]}", ln=True)
-    pdf.cell(0, 6, f"False Negatives: {cm[1][0]}    True Positives:  {cm[1][1]}", ln=True)
-
-    section("Feature Importance Ranking (all evaluated features)")
-    total = ranked_importance.sum() or 1
-    for rank, (feat, imp) in enumerate(ranked_importance.items(), start=1):
-        used = "*" if feat in bundle["feature_names"] else " "
-        line = f"{rank:>2}. [{used}] {feat} - {imp/total*100:.1f}%"
-        pdf.cell(0, 5, _pdf_safe(line), ln=True)
-    pdf.set_font("Helvetica", "I", 8)
-    pdf.cell(0, 5, "[*] = included in the currently trained model", ln=True)
-
-    return bytes(pdf.output())
+    return buffer.getvalue()
 
 
 # ----------------------------------------------------------------------------
@@ -296,18 +346,25 @@ def generate_pdf_report(data_source, df, algorithm, max_depth, n_estimators,
 st.sidebar.title("📁 Dataset")
 uploaded_file = st.sidebar.file_uploader(
     "Upload your own CSV (optional)", type=["csv"],
-    help="Must include an 'Attrition' column (Yes/No target). Any of the standard "
-         "columns can be missing — the app will just work with what's available.",
+    help="If it includes an 'Attrition' Yes/No column, it's used to train and evaluate the model. "
+         "If it doesn't, the model trains on the bundled dataset instead and predicts Attrition for "
+         "your uploaded rows — download the Excel report to get it back with that column added.",
 )
 
 missing_expected = []
+scoring_df = None  # set when the upload has no Attrition column: to be scored, not trained on
 if uploaded_file is not None:
     try:
         user_df = pd.read_csv(uploaded_file)
         if "Attrition" not in user_df.columns:
-            st.sidebar.error("Uploaded file has no 'Attrition' column — falling back to the bundled dataset.")
+            scoring_df = user_df
             df_raw = load_default_data()
-            data_source = "bundled dataset (upload rejected: no 'Attrition' column)"
+            data_source = f"bundled dataset (training) — '{uploaded_file.name}' has no Attrition column, used for scoring"
+            st.sidebar.warning(
+                f"'{uploaded_file.name}' has no 'Attrition' column, so it can't be used to train/evaluate. "
+                "Training on the bundled dataset instead — download the Excel report to get your file back "
+                "with a predicted Attrition column added."
+            )
         else:
             df_raw = user_df
             data_source = f"uploaded file: {uploaded_file.name}"
@@ -388,7 +445,8 @@ if len(selected_features) < 2:
     st.sidebar.error("Select at least 2 features to train a model.")
     st.stop()
 
-pretrained = _load_pretrained(df_raw, selected_features, algorithm, max_depth) if uploaded_file is None else None
+using_bundled_for_training = uploaded_file is None or scoring_df is not None
+pretrained = _load_pretrained(df_raw, selected_features, algorithm, max_depth) if using_bundled_for_training else None
 if pretrained is not None:
     bundle = pretrained
     st.sidebar.success("Using model trained by train.py")
@@ -642,16 +700,28 @@ with tab_model:
         st.dataframe(miss_df, use_container_width=True)
 
     st.markdown("---")
-    st.markdown("#### 📄 Download Report")
-    st.caption("A PDF summary of the dataset, model configuration, performance metrics, and full feature importance ranking.")
-    pdf_bytes = generate_pdf_report(
+    st.markdown("#### 📊 Download Report")
+    if scoring_df is not None:
+        st.caption(
+            "An Excel workbook with dataset summary, metrics, feature importance ranking — plus a "
+            "'Predictions' sheet containing your uploaded file with a predicted **Attrition** column added, "
+            "since it didn't have one."
+        )
+    else:
+        st.caption(
+            "An Excel workbook with dataset summary, metrics, feature importance ranking, and a "
+            "'Predictions' sheet (actual vs. predicted Attrition for every row)."
+        )
+    excel_bytes = generate_excel_report(
         data_source, df_raw, algorithm, max_depth, n_estimators,
         missing_expected, bundle.get("missing_report", {}), bundle, ranked_importance,
+        scoring_df=scoring_df, train_df=df_raw,
     )
     st.download_button(
-        "📥 Download PDF Report", data=pdf_bytes,
-        file_name=f"attrition_report_{datetime.now().strftime('%Y%m%d_%H%M')}.pdf",
-        mime="application/pdf", use_container_width=True,
+        "📥 Download Excel Report", data=excel_bytes,
+        file_name=f"attrition_report_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        use_container_width=True,
     )
 
 # ----------------------------------------------------------------------------
