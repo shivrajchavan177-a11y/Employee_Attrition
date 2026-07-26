@@ -266,6 +266,19 @@ def generate_excel_report(data_source, df, algorithm, max_depth, n_estimators,
                            missing_expected, missing_report, bundle, ranked_importance,
                            scoring_df=None, scoring_notes=None, train_df=None):
     buffer = io.BytesIO()
+
+    # Compute predictions once, up front, so the Summary sheet can reference the count.
+    if scoring_df is not None:
+        pred_out, score_notes = score_dataset(scoring_df, train_df, bundle)
+    else:
+        pred_out, score_notes = score_dataset(df, df, bundle)
+        pred_out.rename(columns={"Attrition": "Actual_Attrition"} if "Attrition" in pred_out.columns else {}, inplace=True)
+
+    predicted_col = "Predicted_Attrition" if "Predicted_Attrition" in pred_out.columns else "Attrition"
+    leaving_df = pred_out[pred_out[predicted_col] == "Yes"].sort_values(
+        "Attrition_Probability_%", ascending=False
+    )
+
     with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
 
         # --- Summary sheet ---------------------------------------------------
@@ -287,6 +300,8 @@ def generate_excel_report(data_source, df, algorithm, max_depth, n_estimators,
         summary_rows.append(("Features used (list)", ", ".join(bundle["feature_names"])))
         if missing_expected:
             summary_rows.append(("Standard features not in dataset", ", ".join(missing_expected)))
+        summary_rows.append(("Employees predicted to leave", f"{len(leaving_df)} of {len(pred_out)}"
+                              f" ({len(leaving_df)/len(pred_out)*100:.1f}%) — see 'Employees Leaving' sheet"))
         if scoring_df is not None:
             summary_rows.append(("Note", "Uploaded file had no 'Attrition' column — model was trained on the "
                                           "bundled dataset and used to predict Attrition for your uploaded rows "
@@ -328,17 +343,14 @@ def generate_excel_report(data_source, df, algorithm, max_depth, n_estimators,
             miss_df.to_excel(writer, sheet_name="Missing Values", index=False)
 
         # --- Predictions sheet ---------------------------------------------------
-        if scoring_df is not None:
-            pred_out, notes = score_dataset(scoring_df, train_df, bundle)
-            pred_out.to_excel(writer, sheet_name="Predictions", index=False)
-            if scoring_notes or notes:
-                pd.DataFrame((scoring_notes or []) + notes, columns=["Note"]).to_excel(
-                    writer, sheet_name="Scoring Notes", index=False
-                )
-        else:
-            pred_out, _ = score_dataset(df, df, bundle)
-            pred_out.rename(columns={"Attrition": "Actual_Attrition"} if "Attrition" in pred_out.columns else {}, inplace=True)
-            pred_out.to_excel(writer, sheet_name="Predictions", index=False)
+        pred_out.to_excel(writer, sheet_name="Predictions", index=False)
+        if scoring_df is not None and (scoring_notes or score_notes):
+            pd.DataFrame((scoring_notes or []) + score_notes, columns=["Note"]).to_excel(
+                writer, sheet_name="Scoring Notes", index=False
+            )
+
+        # --- Employees Leaving sheet (filtered to predicted Yes) ------------------
+        leaving_df.to_excel(writer, sheet_name="Employees Leaving", index=False)
 
     return buffer.getvalue()
 
@@ -706,14 +718,15 @@ with tab_model:
     st.markdown("#### 📊 Download Report")
     if scoring_df is not None:
         st.caption(
-            "An Excel workbook with dataset summary, metrics, feature importance ranking — plus a "
-            "'Predictions' sheet containing your uploaded file with a predicted **Attrition** column added, "
-            "since it didn't have one."
+            "An Excel workbook with dataset summary, metrics, feature importance ranking, a "
+            "'Predictions' sheet containing your uploaded file with a predicted **Attrition** column added "
+            "(since it didn't have one), and an **Employees Leaving** sheet filtered to just those rows."
         )
     else:
         st.caption(
-            "An Excel workbook with dataset summary, metrics, feature importance ranking, and a "
-            "'Predictions' sheet (actual vs. predicted Attrition for every row)."
+            "An Excel workbook with dataset summary, metrics, feature importance ranking, a "
+            "'Predictions' sheet (actual vs. predicted Attrition for every row), and an **Employees Leaving** "
+            "sheet filtered to just those predicted to leave."
         )
     excel_bytes = generate_excel_report(
         data_source, df_raw, algorithm, max_depth, n_estimators,
